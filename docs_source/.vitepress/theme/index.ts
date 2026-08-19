@@ -81,6 +81,56 @@ function getPathWithDocsLocale(pathname: string, locale: "en" | "zh") {
     : localizedPath;
 }
 
+// 基于 VitePress 构建时注入的 __VP_HASH_MAP__（页面 md 文件 -> hash）判断某个
+// docs 路径对应的页面是否真实存在。无法验证时（SSR / 没有 hash map）
+// 保守返回 true，避免误拦正常导航。派生自 getPageChunkPath 的同一套文件名推导。
+function docsHtmlPathExists(pathname: string): boolean {
+  if (!inBrowser || !window.__VP_HASH_MAP__) {
+    return true;
+  }
+  let pagePath = stripDocsPrefix(pathname).replace(/\.html$/, "");
+  try {
+    pagePath = decodeURIComponent(pagePath);
+  } catch {
+    return true;
+  }
+  pagePath = pagePath.replace(/\/$/, "/index");
+  let pageFile =
+    (pagePath.replace(/^\//, "").replace(/\//g, "_") || "index") + ".md";
+  if (window.__VP_HASH_MAP__[pageFile.toLowerCase()]) {
+    return true;
+  }
+  pageFile = pageFile.endsWith("_index.md")
+    ? pageFile.slice(0, -9) + ".md"
+    : pageFile.slice(0, -3) + "_index.md";
+  return Boolean(window.__VP_HASH_MAP__[pageFile.toLowerCase()]);
+}
+
+// VitePress 内置的语言切换菜单把当前路径的 locale 前缀直接替换生成目标
+// 链接，不校验目标页是否存在。对英文独有页（无 zh 译文）它会渲染出指向
+// /zh/... 的死链：用户点击 404，爬虫也会跟进（问题 3「404 → 跳转 → 404」）。
+// 这里把这类指向不存在页面的语言链接改写为当前页自身，切换时停留不跳走。
+function fixLocaleSwitchLinks() {
+  if (!inBrowser) {
+    return;
+  }
+  document
+    .querySelectorAll<HTMLAnchorElement>(
+      ".VPNavBarTranslations a.VPLink, .VPNavBarExtra .group.translations a.VPLink, .VPNavScreenTranslations a.VPLink",
+    )
+    .forEach((a) => {
+      const href = a.getAttribute("href");
+      if (!href || href.startsWith("http") || href.startsWith("#")) {
+        return;
+      }
+      if (docsHtmlPathExists(href)) {
+        return;
+      }
+      // 目标语言无此页 → 让切换停留在当前页，不跳走（不 404、也不甩到首页）。
+      a.setAttribute("href", window.location.pathname);
+    });
+}
+
 function syncDocsLocaleCookie(locale: "en" | "zh") {
   document.cookie = `locale=${locale === "zh" ? "zh-CN" : "en-US"}; path=/; max-age=31536000`;
 }
@@ -133,7 +183,17 @@ function applyRequestedDocsLocale() {
 
   url.searchParams.delete("locale");
   url.searchParams.delete("lang");
-  url.pathname = getPathWithDocsLocale(url.pathname, requestedLocale);
+  const localizedPath = getPathWithDocsLocale(url.pathname, requestedLocale);
+  // 若目标语言版本不存在（如英文独有页没有 zh 译文），不要跳到会 404 的本地化 URL，
+  // 保持当前页面。否则会给爬虫暴露死链。
+  if (!docsHtmlPathExists(localizedPath)) {
+    syncDocsLocaleCookie(currentLocale);
+    if (url.toString() !== window.location.href) {
+      window.history.replaceState({}, document.title, url.toString());
+    }
+    return;
+  }
+  url.pathname = localizedPath;
   syncDocsLocaleCookie(requestedLocale);
 
   if (url.pathname !== window.location.pathname) {
@@ -541,21 +601,28 @@ export default {
 
       console.info("isDocsHost:", isDocsHost);
       updateLogoLink();
-      if (!isDocsHost) {
-        const originAfterRouteChange = router.onAfterRouteChange;
-        router.onAfterRouteChange = async (to) => {
-          await originAfterRouteChange?.(to);
-          // VitePress calls onAfterPageLoad before replacing the route
-          // component. Wait until the new sidebar/content has rendered before
-          // adding the production /docs prefix to newly-created links.
-          await nextTick();
+      // 语言切换死链修复需在所有 host 下执行（含 docs.zenmux.ai / localhost /
+      // preview，它们都是 isDocsHost=true）；rewriteDocsLinks 仍只在非 docs host
+      // 下给站内链接补 /docs 前缀。
+      const applyLinkFixes = () => {
+        fixLocaleSwitchLinks();
+        if (!isDocsHost) {
           rewriteDocsLinks();
-        };
-        window.addEventListener("load", () => {
-          rewriteDocsLinks();
-        });
-        rewriteDocsLinks();
-      }
+        }
+      };
+      const originAfterRouteChange = router.onAfterRouteChange;
+      router.onAfterRouteChange = async (to) => {
+        await originAfterRouteChange?.(to);
+        // VitePress calls onAfterPageLoad before replacing the route
+        // component. Wait until the new sidebar/content has rendered before
+        // patching links.
+        await nextTick();
+        applyLinkFixes();
+      };
+      window.addEventListener("load", () => {
+        applyLinkFixes();
+      });
+      applyLinkFixes();
     }
     // ...
     // app.use(ElementPlus);11

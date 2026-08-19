@@ -528,10 +528,25 @@ export default defineConfig({
   title: "ZenMux | Documentation",
   ignoreDeadLinks: true,
 
-  transformHtml: (html) => {
-    return html.replace(/href="\/vp-icons.css"/g, (_match, p1) => {
+  transformHtml: (html, _id, ctx) => {
+    let out = html.replace(/href="\/vp-icons.css"/g, () => {
       return `href="/docs/vp-icons.css"`;
     });
+    // 构建期消除英文独有页的语言切换死链：VitePress 会把当前页路径
+    // 直接映射到 zh 生成切换链接，不校验 zh 译文是否存在。若当前 en 页
+    // 没有 zh 译文，把静态 HTML 里指向 /zh/<page>.html 的死链改写为当前页自身，
+    // 让切换停留不跳走，避免非 JS 爬虫首屏抓到 404（问题 3）。客户端
+    // hydrate 后由 theme 的 fixLocaleSwitchLinks 兼顾 SPA 导航。
+    const page = ctx?.page || "";
+    if (page && !page.startsWith("zh/")) {
+      const zhExists = fs.existsSync(`${basePath}zh/${page}`);
+      if (!zhExists) {
+        const selfHref = `/${page.replace(/\.md$/, ".html")}`;
+        const deadHref = `/zh${selfHref}`;
+        out = out.split(`href="${deadHref}"`).join(`href="${selfHref}"`);
+      }
+    }
+    return out;
   },
 
   sitemap: {
